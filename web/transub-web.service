@@ -1,0 +1,16 @@
+[Unit]
+Description=Transub LAN subtitle service
+After=network.target
+
+[Service]
+Type=simple
+Environment=TRANSUB_WEB_HOST=0.0.0.0
+WorkingDirectory=%h/Transub
+ExecStart=%h/Transub/web/run.sh
+KillMode=control-group
+TimeoutStopSec=20
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=default.target

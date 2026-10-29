@@ -16,6 +16,13 @@ function isSourceTrack(filePath) {
 }
 
 describe('post-batch JA↔ZH stem pairing', () => {
+    it('preserves POSIX directory preference for Linux and WSL jobs', () => {
+        const source = '/jobs/current/video.src.srt';
+        const sources = new Map([['video', ['/jobs/other/video.src.srt', source]]]);
+        assert.strictEqual(stemKeyForPairing(source, isSourceTrack), 'video');
+        assert.strictEqual(resolveSourceForTarget(sources, '/jobs/current/video.srt', isSourceTrack), source);
+    });
+
     it('matches cross-directory JA src and ZH target by stem', () => {
         const ja = 'F:\\Transub\\subtitles\\START-616.src.srt';
         const zh = 'E:\\un\\START-616.srt';

@@ -23,8 +23,9 @@ function isAppPackaged() {
 function isDevUnlockEnabled() {
     if (isAppPackaged()) return false;
     const v = String(process.env.TRANSUB_ADVANCED_DEV_UNLOCK || '').trim().toLowerCase();
+    if (v === '0' || v === 'false' || v === 'no') return false;
     if (v === '1' || v === 'true' || v === 'yes') return true;
-    // Unpackaged Electron always unlocks Pro for local development.
+    // Unpackaged Electron unlocks Pro unless explicitly disabled above.
     try {
         const { app } = require('electron');
         if (app && typeof app.isPackaged === 'boolean' && !app.isPackaged) return true;

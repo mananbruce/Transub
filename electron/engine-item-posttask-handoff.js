@@ -1378,7 +1378,7 @@ async function runItemPostTaskHandoff(ctx = {}) {
                 if (options.insertSoftwareCredit !== false) {
                     const lang = resolveCreditLangForPath(subPath, item, options);
                     const applied = creditCore.insertSoftwareCreditIntoCues(cues, {
-                        isPro: true,
+                        isPro: require('./subtitle-software-credit').resolveIsPro(),
                         lang,
                         dualLineOrder: options.dualLineOrder,
                         mediaDurationMs: Number(options.mediaDurationMs) || undefined,

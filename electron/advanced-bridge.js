@@ -35,10 +35,11 @@ function isAppPackaged() {
     }
 }
 
-/** Packaged builds ignore TRANSUB_ADVANCED_DEV_UNLOCK; unpackaged auto-unlocks. */
+/** Packaged builds ignore dev unlock; unpackaged can explicitly opt out. */
 function isDevUnlockEnabled() {
     if (isAppPackaged()) return false;
     const v = String(process.env.TRANSUB_ADVANCED_DEV_UNLOCK || '').trim().toLowerCase();
+    if (v === '0' || v === 'false' || v === 'no') return false;
     if (v === '1' || v === 'true' || v === 'yes') return true;
     try {
         const { app } = require('electron');

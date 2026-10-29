@@ -4,6 +4,8 @@
 
 <h1 align="center">Transub</h1>
 
+<p align="center">本 fork 增加局域网上传、官方免费版处理流程与字幕下载。<a href="web/README.md">查看 Web 服务部署说明</a></p>
+
 <p align="center">
   <b>把视频拖进去，出能上片的字幕。</b><br>
   Windows 桌面 · 本地运行 · 转写 / 翻译 / 双语 · SRT · VTT · ASS

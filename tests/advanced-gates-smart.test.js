@@ -32,6 +32,23 @@ describe('advanced-gates requireSmartTranslate (Pro only)', () => {
         } catch (_) { /* ignore */ }
     });
 
+    it('honors an explicit dev-unlock opt-out in unpackaged Electron', () => {
+        const Module = require('module');
+        const originalLoad = Module._load;
+        Module._load = function (request, ...args) {
+            if (request === 'electron') return { app: { isPackaged: false } };
+            return originalLoad.call(this, request, ...args);
+        };
+        try {
+            const gates = require('../electron/advanced-gates');
+            assert.strictEqual(gates.isDevUnlockEnabled(), false);
+            process.env.TRANSUB_ADVANCED_DEV_UNLOCK = '1';
+            assert.strictEqual(gates.isDevUnlockEnabled(), true);
+        } finally {
+            Module._load = originalLoad;
+        }
+    });
+
     it('rejects without Pro even when free-pipeline model would qualify', () => {
         // Write a managed-llm doc that historically unlocked free ≤7B smart translate.
         const docPath = path.join(tmpDir, 'transub-advanced.json');

@@ -156,3 +156,6 @@ tools/_tmp-*
 *.bak-*
 tests/fixtures/mt-train-drafts/
 node_modules/.vite/
+
+# Local Linux environment
+.venv/

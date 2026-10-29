@@ -10,6 +10,10 @@
 const fs = require('fs');
 const path = require('path');
 
+function subtitlePathApi(value) {
+    return /^[a-z]:[\\/]|^\\\\/i.test(String(value || '')) ? path.win32 : path;
+}
+
 /**
  * Basename stem for JA↔ZH pairing (no directory).
  * Engine often writes JA under transcript-keep and ZH next to the video — different
@@ -19,7 +23,7 @@ const path = require('path');
  * @param {(p: string) => boolean} isSourceTrack
  */
 function stemKeyForPairing(filePath, isSourceTrack) {
-    const base = path.basename(String(filePath || ''));
+    const base = subtitlePathApi(filePath).basename(String(filePath || ''));
     let stem = base.replace(/\.(srt|vtt|lrc)$/i, '');
     stem = stem
         .replace(/\.src\.partial$/i, '')
@@ -54,9 +58,13 @@ function resolveSourceForTarget(sourcesByStem, zhPath, isSourceTrack) {
     const stem = stemKeyForPairing(zhPath, isSourceTrack);
     const candidates = sourcesByStem.get(stem) || [];
     if (!candidates.length) return '';
-    const zhDir = path.dirname(path.resolve(String(zhPath || '')));
+    const targetPath = subtitlePathApi(zhPath);
+    const zhDir = targetPath.dirname(targetPath.resolve(String(zhPath || '')));
     const sameDir = candidates.find(
-        (p) => path.dirname(path.resolve(String(p || ''))) === zhDir,
+        (p) => {
+            const sourcePath = subtitlePathApi(p);
+            return sourcePath.dirname(sourcePath.resolve(String(p || ''))) === zhDir;
+        },
     );
     return sameDir || candidates[0] || '';
 }

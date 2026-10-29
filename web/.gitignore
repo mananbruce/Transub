@@ -1,0 +1,9 @@
+data/
+engine-data/
+__pycache__/
+*.log
+
+artifacts/
+
+desktop-data/
+downloads/
