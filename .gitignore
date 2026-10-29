@@ -22,7 +22,7 @@ transub-engine/wheels-edition/
 transub-engine/wheels/
 
 # Engine local caches / heavy weights (standalone runtime/ is vendored)
-transub-engine/.venv/
+transub-engine/.venv
 transub-engine/venv/
 transub-engine/**/__pycache__/
 transub-engine/**/*.pyc
@@ -158,4 +158,4 @@ tests/fixtures/mt-train-drafts/
 node_modules/.vite/
 
 # Local Linux environment
-.venv/
+.venv

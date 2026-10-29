@@ -87,21 +87,37 @@ journalctl --user -u transub-web -n 100 --no-pager
 
 ## 文件与日志
 
-单文件最大 2048 MB，最多 8 个上传中/排队/运行任务，串行执行。坏文件、空文件和无音轨直接拒绝。浏览器保存最近 20 个任务编号。
+页面默认支持最多 24 GiB 文件（覆盖 20 GB / 20 GiB）。按 16 MiB 分片直接写入同一个目标文件，接收时不创建整份 multipart 临时副本；单片核验长度，写入并同步到磁盘后才确认偏移，断线/异常只回退当前未确认分片。旧 `POST /api/jobs` multipart 接口仍限制 2 GiB，大文件应使用页面的新协议。
 
-上传原文件在成功或失败后删除。字幕、报告、状态和该任务的桌面缓存/字幕库记录均保存在 `web/data/{uuid}/`，启动或新上传时清理超过 7 天的任务目录。每个任务的 `desktop/advanced-llm` 链接到共享模型，删除任务不会删除模型。引擎检查点在 `web/engine-data/jobs`，同样按 7 天清理。重启会中断未完成任务并提示重新上传。
+最多同时容纳两个上传/排队/运行任务，仍只运行一个识别任务。开始上传前按文件总大小和处理临时空间做逻辑磁盘预留；并发上传、排队等待及服务重启后开始处理前都重新检查，至少保留 10 GiB 空闲。两小时影片默认预留 4 GiB 临时空间，较长媒体根据探测时长增加。一个 20 GiB 文件需要约 34 GiB 实际空闲空间；两个此类任务约需 58 GiB。其他程序仍可能占用磁盘，运行中空间不足会暂停/报错并保留已确认断点，不保证其他软件不会填满磁盘。
 
-每个任务保留最近 500 条官方桌面进度/处理日志，每条最多 2000 字符；约每 2.5 秒刷新，支持折叠、自动滚动和刷新恢复。旧任务缺少日志时显示“暂无日志记录”。全局服务日志通过 journalctl 查看。
+上传暂停或页面刷新后，重新选择**同一文件和处理方式/语言**即可续传；断线自动重试至多 3 次后暂停。浏览器只读取首尾少量样本识别所选文件，不做耗时的全文件哈希，续传期间不要修改源视频。上传编号先保存在浏览器，再提交到服务器；创建/完成/取消均能处理回复丢失的重试。手机请保持页面前台，浏览器后台冻结或被系统关闭后需重新选择文件继续。
+
+未完成上传保留 24 小时（按最近确认分片计时），每分钟清理过期残片；可随时取消并删除。完成上传的任务在服务重启后重新排队处理，保留源文件，避免再次传输；处理步骤本身可能从头执行。处理失败的完整源文件保留 24 小时，页面支持免上传重试或主动删除；成功后立即删除上传源文件。字幕、报告、状态和任务的桌面缓存/字幕库记录保留 7 天。任务删除不会沿模型目录链接删除共享模型。
+
+Python 引擎的临时目录位于 `${TRANSUB_WEB_DATA}/.engine-tmp`，Electron 的临时目录位于对应任务目录，避免大音频临时文件意外占用系统 `/tmp` 分区。引擎检查点在 `web/engine-data/jobs`，按 7 天清理。
+
+**Windows / WSL 存储注意：**使用支持大文件的 NTFS 或 ext4，不能使用单文件约 4 GiB 上限的 FAT32。WSL 的 Linux 虚拟磁盘报告空闲量可能大于 Windows 宿主盘实际剩余空间，页面会提示；建议将上传目录直接指向实际 Windows 数据盘，例如 `TRANSUB_WEB_DATA=/mnt/d/TransubData`，并同时检查 Windows 盘剩余空间。仅“磁盘容量 200 GB”不代表当前有 200 GB 空闲。
+
+对于 20 GB、两小时电影，视频体积影响传输和磁盘；ASR 主要处理音频。16kHz 单声道 PCM16 约 230 MB，float32 波形约 461 MB，仍有模型/VAD/翻译上下文的额外开销。32 GB 内存、16 GB 显存属于可用配置，但 GPU 驱动、CUDA、推理后端和长视频效果必须实测，不能由这两个容量直接保证速度或准确率。视频本来就在电脑上时，电脑浏览器上传可避免先把 20 GB 复制到手机；手机可查看进度和下载结果。
 
 页面没有账户或跨设备任务列表；任务 UUID 是状态和下载凭据，仅用于可信局域网。不要对外开放 8765 或 llama-server 端口。
 
 ## API
 
-- `GET /api/health`：ASR、桌面运行时及本地翻译模型就绪状态。
-- `POST /api/jobs`：multipart `file`、`language`、`task`（`transcribe` / `translate` / `dual`）、`targetLanguage`（当前 `zh`），返回 HTTP 202 和任务编号。旧客户端省略 task 时仍为原文转写。
+- `GET /api/health`：运行时就绪状态、单文件/分片上限、可用磁盘和 WSL 存储提示。
+- `POST /api/uploads`：JSON `name`、`size`、`fingerprint`、`language`、`task`、`targetLanguage` 创建上传。可提供 UUID 格式的 `Upload-ID` 请求头；客户端应在请求前持久保存此编号，同一编号/元数据重试返回原断点。
+- `GET /api/uploads/{id}`：查询已确认的 `received` 字节数和状态。
+- `PUT /api/uploads/{id}`：原始分片字节，`Content-Length` 不超过 16 MiB，`Upload-Offset` 必须等于服务器断点；超时、超长和未完成分片不会推进偏移。
+- `POST /api/uploads/{id}/complete`：JSON `{}`，校验完整文件与音轨后入队，重复提交不重复创建任务。
+- `DELETE /api/uploads/{id}`：取消未完成上传，或删除失败任务保留的源文件；不会删除已排队/运行任务的输入。
+- `POST /api/jobs/{id}/retry`：JSON `{}`，复用失败任务的完整源文件重新处理。
+- `POST /api/jobs`：旧 multipart `file`、`language`、`task`（`transcribe` / `translate` / `dual`）、`targetLanguage`（当前 `zh`），返回 HTTP 202 和任务编号。旧客户端省略 task 时仍为原文转写。
 - `GET /api/jobs/{id}`：状态、进度、日志、质检计数和可下载文件描述；不返回本地文件路径。
 - `GET /api/jobs/{id}/files/{index}`：下载指定字幕或 JSON 报告。
 - `GET /api/jobs/{id}/subtitle`：兼容旧客户端的默认 SRT 下载。
+
+浏览器分片请求使用已知 Content-Length，不支持 HTTP chunked 请求体。反向代理如有请求体大小限制，设为至少单片 16 MiB（及少量请求开销），并避免把整个请求缓存到内存；不需要放开单请求 20 GB。
 
 翻译模型未就绪时拒绝翻译任务，可选择原文转写。官方流程失败时显示失败原因，不把基础 ASR 输出冒充完整流程成功。
 
@@ -109,7 +125,8 @@ journalctl --user -u transub-web -n 100 --no-pager
 
 ```bash
 cd web
-../.venv/bin/python -m unittest -v test_app
+../.venv/bin/python -m unittest -v test_app test_uploads
+node test_upload_ui.cjs
 cd ..
 ./node_modules/.bin/vitest run tests/advanced-gates-smart.test.js tests/engine-llama-mt.test.js tests/post-batch-pipeline.test.js tests/asr-second-opinion-and-address.test.js tests/item-posttask-handoff.test.js tests/subtitle-software-credit-core.test.js
 ```
@@ -117,3 +134,5 @@ cd ..
 真实端到端验证：通过页面上传带人声的视频，确认日志经历识别、本地翻译与 QC；下载原文/译文/双语字幕与处理报告并抽查语义和时间戳。另检查刷新后恢复下载、手机布局、损坏文件与无音轨提示。不同视频会按官方触发条件跳过不需要的复核/修复阶段。
 
 当前未提供性能或准确率保证，Windows/WSL GPU 需要在目标机器实测。开源 Core 与引擎沿用上游 MIT 许可，模型遵循各自许可，未使用闭源 Pro 算法。模型、缓存、上传文件、日志和测试产物均不随代码提交。
+
+大文件验证：20 GiB 偏移/容量边界使用稀疏文件验证，另以约 48 MiB 视频通过真实浏览器模拟断线、暂停、刷新续传、取消，并完成官方字幕处理和下载。未使用真实 20 GiB 两小时影片进行全字节传输与推理，也未对用户家用 Windows GPU 实测。

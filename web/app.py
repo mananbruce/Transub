@@ -1,9 +1,12 @@
 """Small LAN gateway; the engine stays on loopback and owns ASR."""
 import asyncio
+import errno
 from contextlib import asynccontextmanager
 import json
 import logging
+import math
 import os
+import platform
 from pathlib import Path
 import shutil
 import signal
@@ -14,6 +17,7 @@ from uuid import UUID, uuid4
 import httpx
 from fastapi import FastAPI, File, Form, HTTPException, Request, UploadFile
 from fastapi.responses import FileResponse, HTMLResponse, JSONResponse
+from pydantic import BaseModel, Field
 
 ROOT = Path(__file__).resolve().parent
 DATA = Path(os.environ.get('TRANSUB_WEB_DATA', ROOT / 'data')).resolve()
@@ -23,12 +27,21 @@ DEVICE = os.environ.get('TRANSUB_DEVICE', 'cpu')
 MT_MODEL = os.environ.get('TRANSUB_MT_MODEL', 'qwen3-4b')
 TARGET_LANGUAGES = {'zh'}
 TASKS = {'transcribe', 'translate', 'dual'}
-MAX_BYTES = int(os.environ.get('TRANSUB_MAX_UPLOAD_MB', '2048')) * 1024 * 1024
+MAX_BYTES = int(os.environ.get('TRANSUB_MAX_UPLOAD_MB', '24576')) * 1024 * 1024
+LEGACY_MAX_BYTES = min(MAX_BYTES, 2 * 1024**3)
+CHUNK_BYTES = 16 * 1024**2
+CHUNK_TIMEOUT = 180
+CAPACITY = 2
+MIN_FREE = 10 * 1024**3
+WORKSPACE = 4 * 1024**3
+UPLOAD_TTL = 86400
 RETENTION = 7 * 86400
 EXTENSIONS = {'.mp4', '.mkv', '.mov', '.avi', '.webm', '.m4v', '.mpeg', '.mpg', '.ts', '.mp3', '.wav', '.flac', '.m4a', '.ogg', '.aac'}
 LANGUAGES = {'auto', 'zh', 'en', 'ja', 'ko', 'fr', 'de', 'es', 'ru'}
 queue: asyncio.Queue
 slots: asyncio.Semaphore
+active: dict = {}
+upload_locks: dict = {}
 
 
 def job_dir(job_id):
@@ -62,12 +75,86 @@ def prune():
             UUID(folder.name)
         except ValueError:
             continue
+        if folder.name in active:
+            continue
         if time.time() - folder.stat().st_mtime > RETENTION:
             shutil.rmtree(folder)
     engine_jobs = Path(os.environ.get('TRANSUB_ENGINE_DATA', ROOT / 'engine-data')) / 'jobs'
     for snapshot in engine_jobs.glob('*.json'):
         if time.time() - snapshot.stat().st_mtime > RETENTION:
             snapshot.unlink()
+
+
+def disk_check(extra=0, exclude=None):
+    reserved = sum(max(0, job.get('size', 0) - job.get('received', 0)) + job.get('workspace', WORKSPACE)
+                   for key, job in active.items() if key != exclude)
+    if shutil.disk_usage(DATA).free < MIN_FREE + reserved + extra:
+        raise HTTPException(507, '磁盘空间不足：需要容纳文件、处理临时空间，并保留至少 10 GiB 空闲')
+
+
+def release_slot(job_id):
+    if active.pop(job_id, None) is not None:
+        slots.release()
+    upload_locks.pop(job_id, None)
+
+
+def expire_uploads(history=True):
+    now = time.time()
+    for job_id, job in list(active.items()):
+        lock = upload_locks.get(job_id)
+        if job['status'] == 'uploading' and now - job.get('updated', job['created']) > UPLOAD_TTL and not (lock and lock.locked()):
+            shutil.rmtree(job_dir(job_id))
+            release_slot(job_id)
+    if not history:
+        return
+    for source in DATA.glob('*/input.*'):
+        if source.parent.is_symlink():
+            continue
+        try:
+            job_dir(source.parent.name)
+        except HTTPException:
+            continue
+        if source.parent.name in active or now - source.parent.stat().st_mtime < UPLOAD_TTL:
+            continue
+        job = json.loads((source.parent / 'job.json').read_text())
+        if job['status'] in {'error', 'cancelled'} and source.name == 'input' + job['extension']:
+            source.unlink(missing_ok=True)
+    prune()
+
+
+async def maintenance():
+    while True:
+        await asyncio.sleep(60)
+        try:
+            expire_uploads()
+        except OSError:
+            logging.getLogger(__name__).exception('Cannot clean expired uploads')
+
+
+async def validate_media(path):
+    probe = await asyncio.create_subprocess_exec('ffprobe', '-v', 'error', '-show_entries', 'stream=codec_type:format=duration', '-of', 'json', str(path),
+                                                  stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.DEVNULL)
+    try:
+        stdout, _ = await asyncio.wait_for(probe.communicate(), timeout=60)
+    except asyncio.TimeoutError:
+        probe.kill()
+        await probe.wait()
+        raise HTTPException(400, '音轨校验超时，已上传文件会保留，可稍后重试或取消')
+    except BaseException:
+        if probe.returncode is None:
+            probe.kill()
+        await probe.wait()
+        raise
+    try:
+        info = json.loads(stdout)
+        duration = float(info.get('format', {}).get('duration') or 0)
+    except (ValueError, TypeError):
+        raise HTTPException(400, '无法读取媒体文件')
+    if probe.returncode or not any(stream.get('codec_type') == 'audio' for stream in info.get('streams', [])):
+        raise HTTPException(400, '文件无有效音轨，无法生成字幕')
+    if not math.isfinite(duration) or duration < 0:
+        raise HTTPException(400, '无效的媒体时长')
+    return duration
 
 
 def append_log(job, message, *, stage='', level='info', timestamp=None):
@@ -83,7 +170,13 @@ def append_log(job, message, *, stage='', level='info', timestamp=None):
 
 def desktop_runtime_ready():
     executable = ROOT.parent / 'node_modules/electron/dist' / ('electron.exe' if sys.platform == 'win32' else 'electron')
-    return executable.is_file() and (sys.platform == 'win32' or bool(os.environ.get('DISPLAY')) or shutil.which('xvfb-run') is not None)
+    return executable.is_file() and shutil.which('ffmpeg') is not None and shutil.which('ffprobe') is not None and (sys.platform == 'win32' or bool(os.environ.get('DISPLAY')) or shutil.which('xvfb-run') is not None)
+
+
+def storage_warning():
+    if 'microsoft' in platform.release().lower() and not (str(DATA).startswith('/mnt/') and len(DATA.parts) > 2 and len(DATA.parts[2]) == 1):
+        return 'WSL 虚拟磁盘的空闲空间可能大于 Windows 宿主盘实际空闲，请同时检查宿主盘或选择实际数据盘存储'
+    return ''
 
 
 def local_translation_ready():
@@ -142,6 +235,9 @@ async def run_desktop_pipeline(job):
     if sys.platform != 'win32' and not os.environ.get('DISPLAY'):
         command = ['xvfb-run', '-a', *command]
     env = {k: v for k, v in os.environ.items() if k != 'ELECTRON_RUN_AS_NODE'}
+    scratch = folder / 'scratch'
+    scratch.mkdir(exist_ok=True)
+    env.update(TMPDIR=str(scratch), TMP=str(scratch), TEMP=str(scratch))
     process = await asyncio.create_subprocess_exec(*command, cwd=ROOT.parent, env=env,
                                                   stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.STDOUT, limit=1024*1024,
                                                   start_new_session=os.name == 'posix')
@@ -208,6 +304,7 @@ async def worker():
     while True:
         job = await queue.get()
         try:
+            disk_check(job.get('workspace', WORKSPACE), exclude=job['id'])
             job.update(status='running', progress={'detail': '启动官方免费版处理流程'})
             append_log(job, f'官方免费流程 · ASR {MODEL} · 本地翻译 {MT_MODEL} · 设备 {DEVICE}', stage='start')
             result = await run_desktop_pipeline(job)
@@ -217,37 +314,69 @@ async def worker():
                        qcIssueCount=sum(int(item.get('qcIssueCount') or 0) for item in result.get('results', [])))
             append_log(job, f"处理完成 · 质检剩余 {job['qcIssueCount']} 项 · 字幕可以下载", stage='done')
         except Exception as error:
-            job.update(status='error', error=str(error))
+            job.update(status='error', error=str(error), updated=time.time())
             append_log(job, str(error), stage='error', level='error')
         finally:
-            (job_dir(job['id']) / ('input' + job['extension'])).unlink(missing_ok=True)
-            slots.release()
+            if job['status'] == 'done':
+                (job_dir(job['id']) / ('input' + job['extension'])).unlink(missing_ok=True)
+            shutil.rmtree(job_dir(job['id']) / 'scratch', ignore_errors=True)
+            release_slot(job['id'])
             queue.task_done()
 
 
 @asynccontextmanager
 async def lifespan(app):
-    global queue, slots
-    queue = asyncio.Queue(maxsize=8)
-    slots = asyncio.Semaphore(8)
+    global queue, slots, active, upload_locks
+    queue = asyncio.Queue(maxsize=CAPACITY)
+    slots = asyncio.Semaphore(CAPACITY)
+    active, upload_locks = {}, {}
     DATA.mkdir(parents=True, exist_ok=True)
-    prune()
     for path in DATA.glob('*/job.json'):
         job = json.loads(path.read_text())
-        if job['status'] in {'queued', 'running'}:
-            job.update(status='error', error='服务已重启，请重新上传')
-            append_log(job, job['error'], stage='error', level='error')
-            (path.parent / ('input' + job['extension'])).unlink(missing_ok=True)
+        source = path.parent / ('input' + job['extension'])
+        if job['status'] == 'uploading' and time.time() - job.get('updated', job['created']) > UPLOAD_TTL:
+            shutil.rmtree(path.parent)
+            continue
+        if job['status'] in {'uploading', 'queued', 'running'}:
+            if job['status'] != 'uploading' and not job.get('size') and source.is_file() and job.get('name') and job.get('language'):
+                job.update(size=source.stat().st_size, received=source.stat().st_size, workspace=WORKSPACE)
+            received = job.get('received', 0)
+            valid = 0 <= received <= job.get('size', 0) <= MAX_BYTES and job.get('size', 0) > 0 and source.is_file() and source.stat().st_size >= received
+            if valid and not slots.locked():
+                await slots.acquire()
+                active[job['id']] = job
+                upload_locks[job['id']] = asyncio.Lock()
+                if job['status'] == 'uploading':
+                    with source.open('r+b') as target:
+                        target.truncate(received)
+                elif source.stat().st_size == job['size']:
+                    job.update(status='queued')
+                    append_log(job, '服务已重启，保留源文件并重新排队', stage='queued')
+                    queue.put_nowait(job)
+                else:
+                    release_slot(job['id'])
+                    job.update(status='error', error='源文件不完整，请重新上传')
+                    save_job(job)
+            else:
+                job.update(status='error', error='服务重启后恢复队列已满，可稍后重试' if valid else '服务已重启，源文件不完整，请重新上传')
+                save_job(job)
+                intact = source.is_file() and job.get('size', 0) > 0 and source.stat().st_size == job['size']
+                if not valid and not intact:
+                    source.unlink(missing_ok=True)
+    expire_uploads()
     task = asyncio.create_task(worker())
+    cleaner = asyncio.create_task(maintenance())
     app.state.worker = task
     yield
+    cleaner.cancel()
     task.cancel()
-    try:
-        await task
-    except asyncio.CancelledError:
-        pass
-    except Exception:
-        logging.getLogger(__name__).exception('Task worker stopped; restart after fixing storage/runtime errors')
+    for pending in (cleaner, task):
+        try:
+            await pending
+        except asyncio.CancelledError:
+            pass
+        except Exception:
+            logging.getLogger(__name__).exception('Background task stopped; check storage/runtime and restart')
 
 
 app = FastAPI(lifespan=lifespan, docs_url=None, redoc_url=None)
@@ -260,33 +389,62 @@ def worker_ready():
 
 @app.middleware('http')
 async def upload_boundary(request: Request, call_next):
-    reserve = request.method == 'POST' and request.url.path == '/api/jobs'
-    if request.method == 'POST':
+    reserve = request.method == 'POST' and request.url.path in {'/api/jobs', '/api/uploads'}
+    mutating = request.method in {'POST', 'PUT', 'DELETE'}
+    size = 0
+    if mutating:
         origin = request.headers.get('origin')
         if origin and origin != f'{request.url.scheme}://{request.headers.get("host")}':
             return JSONResponse({'detail': '不允许跨站上传'}, status_code=403)
+    if request.method in {'POST', 'PUT'}:
         if 'transfer-encoding' in request.headers:
             return JSONResponse({'detail': '请使用带 Content-Length 的文件上传'}, status_code=400)
         try:
             size = int(request.headers.get('content-length', '0'))
         except ValueError:
             return JSONResponse({'detail': '无效的上传长度'}, status_code=400)
+        limit = LEGACY_MAX_BYTES + 1024**2 if request.url.path == '/api/jobs' else CHUNK_BYTES if request.method == 'PUT' else 16384
         if size <= 0:
             return JSONResponse({'detail': '请提供上传长度'}, status_code=411)
-        if size > MAX_BYTES + 1024 * 1024:
-            return JSONResponse({'detail': '文件超过上传限制'}, status_code=413)
+        if size > limit:
+            return JSONResponse({'detail': '请求过大；大文件请使用分片上传'}, status_code=413)
+    if request.method == 'POST' and request.url.path == '/api/uploads' and request.headers.get('upload-id'):
+        try:
+            requested_id = job_dir(request.headers['upload-id']).name
+        except HTTPException:
+            return JSONResponse({'detail': '无效的上传编号'}, status_code=400)
+        request.state.task_id = requested_id
+        if (job_dir(requested_id) / 'job.json').is_file():
+            reserve = False
+        elif requested_id in active:
+            return JSONResponse({'detail': '上传正在创建，请稍后恢复'}, status_code=409)
     if reserve:
+        expire_uploads(history=False)
         if not worker_ready():
             return JSONResponse({'detail': '任务工作进程已停止，请检查服务日志并重启'}, status_code=503)
         if slots.locked():
-            return JSONResponse({'detail': '任务队列已满，请稍后再试'}, status_code=429)
+            return JSONResponse({'detail': '最多同时保留两个上传/排队/处理任务，请先取消未完成上传或等待处理完成'}, status_code=429)
         await slots.acquire()
+        task_id = getattr(request.state, 'task_id', None) or str(uuid4())
+        request.state.task_id = task_id
         request.state.upload_slot_reserved = True
+        active[task_id] = {'id': task_id, 'status': 'receiving', 'size': size * 2 if request.url.path == '/api/jobs' else 0, 'received': 0, 'workspace': WORKSPACE}
+        try:
+            disk_check()
+        except HTTPException as error:
+            release_slot(task_id)
+            return JSONResponse({'detail': error.detail}, status_code=error.status_code)
     try:
-        response = await call_next(request)
+        if reserve and request.url.path == '/api/uploads':
+            try:
+                response = await asyncio.wait_for(call_next(request), timeout=30)
+            except asyncio.TimeoutError:
+                response = JSONResponse({'detail': '上传创建超时，请使用原上传编号重试'}, status_code=408)
+        else:
+            response = await call_next(request)
     finally:
         if reserve and request.state.upload_slot_reserved:
-            slots.release()
+            release_slot(request.state.task_id)
     response.headers['X-Content-Type-Options'] = 'nosniff'
     response.headers['Cache-Control'] = 'no-store'
     return response
@@ -308,7 +466,7 @@ async def health():
             engine = r.json()
             models = (await client.get(ENGINE + '/v1/models')).json()
         ready = any(m.get('id') == MODEL and m.get('installed') for m in models.get('models', []))
-        return {'ok': bool(engine.get('ok')) and ready and not engine.get('stub') and desktop_runtime_ready(), 'model': MODEL, 'device': DEVICE, 'mtModel': MT_MODEL, 'translationReady': local_translation_ready(), 'maxUploadMB': MAX_BYTES // 1024 // 1024}
+        return {'ok': bool(engine.get('ok')) and ready and not engine.get('stub') and desktop_runtime_ready(), 'model': MODEL, 'device': DEVICE, 'mtModel': MT_MODEL, 'translationReady': local_translation_ready(), 'maxUploadMB': MAX_BYTES // 1024 // 1024, 'chunkBytes': CHUNK_BYTES, 'maxTasks': CAPACITY, 'freeDiskBytes': shutil.disk_usage(DATA).free, 'storageWarning': storage_warning()}
     except Exception:
         return {'ok': False, 'message': '字幕引擎未就绪', 'model': MODEL}
 
@@ -322,7 +480,7 @@ async def upload(request: Request, file: UploadFile = File(...), language: str =
     if task != 'transcribe' and not local_translation_ready():
         await file.close()
         raise HTTPException(503, '本地翻译模型尚未就绪，请选择原文转写或等待模型安装完成')
-    folder = DATA / str(uuid4())
+    folder = DATA / request.state.task_id
     try:
         prune()
         folder.mkdir()
@@ -330,21 +488,15 @@ async def upload(request: Request, file: UploadFile = File(...), language: str =
         with (folder / ('input' + extension)).open('wb') as target:
             while chunk := await file.read(1024 * 1024):
                 size += len(chunk)
-                if size > MAX_BYTES:
+                if size > LEGACY_MAX_BYTES:
                     raise HTTPException(413, '文件超过上传限制')
                 target.write(chunk)
         if size == 0:
             raise HTTPException(400, '文件为空')
-        probe = await asyncio.create_subprocess_exec('ffprobe', '-v', 'error', '-show_entries', 'stream=codec_type', '-of', 'json', str(folder / ('input' + extension)), stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.DEVNULL)
-        try:
-            stdout, _ = await asyncio.wait_for(probe.communicate(), timeout=30)
-        except asyncio.TimeoutError:
-            probe.kill()
-            await probe.wait()
-            raise HTTPException(400, '无法读取媒体文件')
-        if probe.returncode or not any(s.get('codec_type') == 'audio' for s in json.loads(stdout).get('streams', [])):
-            raise HTTPException(400, '文件无有效音轨，无法生成字幕')
-        job = {'id': folder.name, 'name': Path(file.filename).name, 'extension': extension, 'language': language, 'task': task, 'targetLanguage': targetLanguage, 'status': 'queued', 'created': time.time(), 'progress': {}}
+        duration = await validate_media(folder / ('input' + extension))
+        job = {'id': folder.name, 'name': Path(file.filename).name, 'extension': extension, 'language': language, 'task': task, 'targetLanguage': targetLanguage, 'status': 'queued', 'created': time.time(), 'updated': time.time(), 'size': size, 'received': size, 'workspace': max(WORKSPACE, math.ceil(duration * 64000 * 4)), 'progress': {}}
+        disk_check(job['workspace'], exclude=job['id'])
+        active[job['id']] = job
         append_log(job, '上传完成，等待处理', stage='queued')
         queue.put_nowait(job)
         request.state.upload_slot_reserved = False
@@ -360,6 +512,8 @@ async def upload(request: Request, file: UploadFile = File(...), language: str =
 async def status(job_id: str):
     job = read_job(job_id)
     visible = {k: v for k, v in job.items() if k not in {'subtitle', 'engine_id', 'extension', 'outputs'}}
+    source = job_dir(job_id) / ('input' + job['extension'])
+    visible['canRetry'] = job['status'] == 'error' and source.is_file() and source.stat().st_size == job.get('size')
     visible['outputs'] = [{k: v for k, v in output.items() if k != 'path'} for output in job.get('outputs', [])]
     return visible
 
@@ -387,3 +541,205 @@ async def download_output(job_id: str, index: int):
         raise HTTPException(404, '文件不存在')
     filename = Path(job['name']).stem + '.' + output['label'] + path.suffix
     return FileResponse(path, media_type='application/octet-stream', filename=filename)
+
+
+class UploadSpec(BaseModel):
+    name: str = Field(min_length=1, max_length=255)
+    size: int = Field(gt=0, strict=True)
+    fingerprint: str = Field(default='', max_length=2048)
+    language: str = Field(default='auto', max_length=16)
+    task: str = Field(default='transcribe', max_length=16)
+    targetLanguage: str = Field(default='zh', max_length=16)
+    model_config = {'extra': 'forbid'}
+
+
+def check_options(language, task, target):
+    if not shutil.which('ffmpeg') or not shutil.which('ffprobe'):
+        raise HTTPException(503, '请先安装 FFmpeg 和 ffprobe，再上传大文件')
+    if language not in LANGUAGES or task not in TASKS or target not in TARGET_LANGUAGES:
+        raise HTTPException(400, '不支持的语言或处理方式')
+    if task != 'transcribe' and not local_translation_ready():
+        raise HTTPException(503, '本地翻译模型尚未就绪')
+
+
+@app.post('/api/uploads', status_code=201)
+async def create_upload(request: Request, spec: UploadSpec):
+    existing = job_dir(request.state.task_id) / 'job.json'
+    if existing.is_file():
+        job = read_job(request.state.task_id)
+        expected = spec.model_dump()
+        expected['name'] = Path(spec.name).name
+        if any(job.get(key) != value for key, value in expected.items()):
+            raise HTTPException(409, '上传编号对应其他文件或处理方式')
+        return {'id': job['id'], 'received': job['received'], 'status': job['status'], 'chunkBytes': CHUNK_BYTES}
+    extension = Path(spec.name).suffix.lower()
+    if extension not in EXTENSIONS:
+        raise HTTPException(400, '不支持的音视频文件')
+    if spec.size > MAX_BYTES:
+        raise HTTPException(413, '文件超过上传上限')
+    check_options(spec.language, spec.task, spec.targetLanguage)
+    disk_check(spec.size + WORKSPACE, exclude=request.state.task_id)
+    folder = job_dir(request.state.task_id)
+    try:
+        folder.mkdir()
+        (folder / ('input' + extension)).touch(exist_ok=False)
+        job = dict(spec.model_dump(), id=folder.name, name=Path(spec.name).name, extension=extension,
+                   status='uploading', received=0, created=time.time(), updated=time.time(), workspace=WORKSPACE, progress={})
+        append_log(job, '开始分片上传，断线后可重新选择同一文件继续', stage='upload')
+        active[job['id']] = job
+        upload_locks[job['id']] = asyncio.Lock()
+        request.state.upload_slot_reserved = False
+        return {'id': job['id'], 'received': 0, 'status': 'uploading', 'chunkBytes': CHUNK_BYTES}
+    except BaseException:
+        shutil.rmtree(folder, ignore_errors=True)
+        raise
+
+
+@app.get('/api/uploads/{job_id}')
+async def upload_status(job_id: str):
+    job = read_job(job_id)
+    return {key: job.get(key) for key in ('id', 'name', 'size', 'received', 'fingerprint', 'status', 'language', 'task', 'targetLanguage')}
+
+
+def upload_lock(job_id):
+    job_dir(job_id)
+    job = active.get(job_id)
+    if not job or job['status'] != 'uploading':
+        raise HTTPException(409, '上传不存在、已过期或已提交，请刷新任务状态')
+    lock = upload_locks[job_id]
+    if lock.locked():
+        raise HTTPException(409, '上一分片仍在处理中，请稍后重试')
+    return job, lock
+
+
+@app.put('/api/uploads/{job_id}')
+async def put_chunk(job_id: str, request: Request):
+    job, lock = upload_lock(job_id)
+    try:
+        offset = int(request.headers.get('upload-offset', '-1'))
+        length = int(request.headers.get('content-length', '0'))
+    except ValueError:
+        raise HTTPException(400, '无效的分片位置')
+    async with lock:
+        start = job['received']
+        if offset != start:
+            raise HTTPException(409, f'分片位置不匹配，服务器已接收 {start} 字节')
+        if not 0 < length <= CHUNK_BYTES or start + length > job['size']:
+            raise HTTPException(413, '分片超过文件大小或单片上限')
+        disk_check()
+        source = job_dir(job_id) / ('input' + job['extension'])
+        seen = 0
+        with source.open('r+b', buffering=0) as target:
+            target.seek(start)
+            target.truncate(start)
+            try:
+                async def receive():
+                    nonlocal seen
+                    async for chunk in request.stream():
+                        if seen + len(chunk) > length:
+                            raise HTTPException(413, '分片实际长度超过声明值')
+                        remaining = memoryview(chunk)
+                        while remaining:
+                            written = target.write(remaining)
+                            if not written:
+                                raise OSError(errno.EIO, 'short file write')
+                            remaining = remaining[written:]
+                        seen += len(chunk)
+                await asyncio.wait_for(receive(), timeout=CHUNK_TIMEOUT)
+                if seen != length:
+                    raise HTTPException(400, '分片不完整，请重新发送')
+                target.flush()
+                os.fsync(target.fileno())
+                job.update(received=start + seen, updated=time.time())
+                save_job(job)
+            except BaseException as error:
+                job['received'] = start
+                target.seek(start)
+                target.truncate(start)
+                target.flush()
+                if isinstance(error, asyncio.TimeoutError):
+                    raise HTTPException(408, '分片接收超时，已保留之前的上传断点')
+                if isinstance(error, OSError) and error.errno in {errno.ENOSPC, errno.EDQUOT}:
+                    raise HTTPException(507, '磁盘写入失败，请释放磁盘空间后继续上传')
+                if isinstance(error, OSError) and error.errno == errno.EFBIG:
+                    raise HTTPException(413, '存储文件系统不支持该文件大小，请使用支持大文件的磁盘')
+                raise
+        return {'id': job_id, 'received': job['received']}
+
+
+@app.post('/api/uploads/{job_id}/complete', status_code=202)
+async def complete_upload(job_id: str):
+    previous = read_job(job_id)
+    if previous['status'] in {'queued', 'running', 'done'}:
+        return {'id': job_id, 'status': previous['status']}
+    job, lock = upload_lock(job_id)
+    async with lock:
+        if not worker_ready():
+            raise HTTPException(503, '处理服务未就绪，已上传文件会保留，请稍后重试')
+        source = job_dir(job_id) / ('input' + job['extension'])
+        if job['received'] != job['size'] or source.stat().st_size != job['size']:
+            raise HTTPException(409, '文件尚未上传完成')
+        check_options(job['language'], job['task'], job['targetLanguage'])
+        duration = await validate_media(source)
+        workspace = max(WORKSPACE, math.ceil(duration * 64000 * 4))
+        disk_check(workspace, exclude=job_id)
+        job.update(status='queued', duration=duration, workspace=workspace, updated=time.time())
+        try:
+            append_log(job, '上传完成，音轨校验通过，等待处理', stage='queued')
+        except BaseException:
+            job['status'] = 'uploading'
+            raise
+        queue.put_nowait(job)
+        return {'id': job_id, 'status': 'queued'}
+
+
+@app.delete('/api/uploads/{job_id}')
+async def cancel_upload(job_id: str):
+    previous = read_job(job_id)
+    source = job_dir(job_id) / ('input' + previous['extension'])
+    if previous['status'] == 'cancelled':
+        source.unlink(missing_ok=True)
+        return {'id': job_id, 'status': 'cancelled'}
+    if previous['status'] == 'error' and job_id not in active:
+        previous.update(status='cancelled', error=None, updated=time.time())
+        save_job(previous)
+        source.unlink(missing_ok=True)
+        return {'id': job_id, 'status': 'cancelled'}
+    job, lock = upload_lock(job_id)
+    async with lock:
+        old_updated = job['updated']
+        job.update(status='cancelled', updated=time.time())
+        try:
+            save_job(job)
+        except BaseException:
+            job.update(status='uploading', updated=old_updated)
+            raise
+        try:
+            source.unlink(missing_ok=True)
+        finally:
+            release_slot(job_id)
+        return {'id': job_id, 'status': 'cancelled'}
+
+
+@app.post('/api/jobs/{job_id}/retry', status_code=202)
+async def retry_job(job_id: str):
+    job = read_job(job_id)
+    source = job_dir(job_id) / ('input' + job['extension'])
+    if job['status'] != 'error' or not source.is_file() or source.stat().st_size != job.get('size'):
+        raise HTTPException(409, '没有可重试的完整源文件，请重新上传')
+    if not worker_ready():
+        raise HTTPException(503, '处理服务未就绪')
+    check_options(job['language'], job.get('task', 'transcribe'), job.get('targetLanguage', 'zh'))
+    if slots.locked():
+        raise HTTPException(429, '任务队列已满，请稍后重试')
+    disk_check(job.get('workspace', WORKSPACE))
+    await slots.acquire()
+    try:
+        job.update(status='queued', updated=time.time(), error=None)
+        append_log(job, '使用已上传的源文件重新处理', stage='queued')
+        active[job_id] = job
+        queue.put_nowait(job)
+    except BaseException:
+        slots.release()
+        raise
+    return {'id': job_id, 'status': 'queued'}

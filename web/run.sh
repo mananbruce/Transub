@@ -4,10 +4,15 @@ cd "$(dirname "$0")/.."
 export PYTHONPATH="$PWD/transub-engine/runtime/Lib/site-packages${PYTHONPATH:+:$PYTHONPATH}"
 export TRANSUB_ENGINE_HOME="$PWD/transub-engine"
 export TRANSUB_ENGINE_DATA="$PWD/web/engine-data"
+export TMPDIR="${TRANSUB_WEB_DATA:-$PWD/web/data}/.engine-tmp"
+mkdir -p "$TMPDIR"
+export TMP="$TMPDIR" TEMP="$TMPDIR" TRANSUB_ENGINE_TEMP="$TMPDIR"
 export TRANSUB_DEVICE="${TRANSUB_DEVICE:-cpu}"
 export CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:--1}"
 export OMP_NUM_THREADS="${OMP_NUM_THREADS:-4}"
 export TRANSUB_ENGINE_URL=http://127.0.0.1:8765
+export NO_PROXY="127.0.0.1,localhost,::1${NO_PROXY:+,$NO_PROXY}"
+export no_proxy="$NO_PROXY"
 export TRANSUB_ENGINE_PYTHON="$PWD/.venv/bin/python"
 setsid .venv/bin/python -m uvicorn transub_engine.server:create_app --factory --host 127.0.0.1 --port 8765 &
 engine_pid=$!
